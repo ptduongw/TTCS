@@ -4,92 +4,131 @@ from insightface.app import FaceAnalysis
 import os
 from datetime import datetime
 
-# 1. Khởi tạo AI (Bộ não)
+# ==========================================================
+# 1. THIẾT LẬP HỆ THỐNG (SETUP)
+# ==========================================================
+# Khởi tạo AI (Sử dụng CPU, nếu có GPU thì đổi thành CUDAExecutionProvider)
 app = FaceAnalysis(name='buffalo_l', providers=['CPUExecutionProvider'])
 app.prepare(ctx_id=0, det_size=(640, 640))
 
-# 2. Nạp ảnh mẫu của Duong để máy "học" mặt
-img_path = "data_faces/duong.jpg"
-if not os.path.exists(img_path):
-    print(f"Lỗi: Không tìm thấy ảnh {img_path} rồi ông ơi!")
-    exit()
+known_embeddings = []
+known_names = []
+known_ids = []
+known_roles = [] # Lưu: 'Admin' hoặc 'Staff'
 
-img_sample = cv2.imread(img_path)
-faces_sample = app.get(img_sample)
+# Tự động nạp dữ liệu từ thư mục ảnh mẫu
+# Yêu cầu tên file: ChucVu_MaSV_Ten.jpg (VD: Admin_B23DCCN224_Duong.jpg)
+folder_path = "data_faces"
+if not os.path.exists(folder_path):
+    os.makedirs(folder_path)
+    print(f"[*] Da tao thu muc {folder_path}. Hay bo anh vao day roi chay lai!")
 
-if len(faces_sample) == 0:
-    print("AI không tìm thấy mặt trong ảnh mẫu. Ông chụp lại ảnh khác nhé!")
-    exit()
+for filename in os.listdir(folder_path):
+    if filename.endswith((".jpg", ".png", ".jpeg")):
+        try:
+            parts = filename.split("_")
+            role = parts[0]
+            user_id = parts[1]
+            user_name = parts[2].split(".")[0]
+            
+            img = cv2.imread(os.path.join(folder_path, filename))
+            res = app.get(img)
+            if res:
+                known_embeddings.append(res[0].normed_embedding)
+                known_roles.append(role)
+                known_ids.append(user_id)
+                known_names.append(user_name)
+                print(f"[+] Da nap: {role} - {user_name}")
+        except Exception as e:
+            print(f"[!] Loi dinh dang file {filename}: {e}")
 
-# Lấy mã định danh (Embedding) của Duong
-embedding_duong = faces_sample[0].normed_embedding
+# Biến quản lý dữ liệu trong phiên làm việc
+# Cấu trúc: { "ID": {"name": "...", "role": "...", "in": datetime, "out": datetime} }
+attendance_data = {}
+current_admin_online = None
 
-# 3. Mở Camera để bắt đầu điểm danh
+# ==========================================================
+# 2. VÒNG LẶP NHẬN DIỆN VÀ CHẤM CÔNG
+# ==========================================================
 cap = cv2.VideoCapture(0)
-
-print("Hệ thống đang chạy... Nhìn vào Camera đi ông!")
-
-last_recorded_times = {} 
-COOLDOWN_MINUTES = 1 # Số phút giãn cách
+print("\n>>> He thong dang chay. Nhan 'Q' de thoat.")
 
 while True:
     ret, frame = cap.read()
     if not ret: break
-
-    # Quét khuôn mặt đang đứng trước cam
+    
     faces = app.get(frame)
+    now = datetime.now()
+    current_admin_online = None # Reset mỗi khung hình
 
     for face in faces:
-        bbox = face.bbox.astype(int)
-        embedding_unknown = face.normed_embedding # Mã của người đang đứng trước cam
+        emb = face.normed_embedding
+        # Thuật toán so khớp Cosine Similarity
+        scores = np.dot(known_embeddings, emb)
+        best_idx = np.argmax(scores)
         
-        # So sánh độ giống nhau giữa Cam và Ảnh mẫu (Cosine Similarity)
-        # Điểm số càng gần 1.0 thì càng giống nhau
-        score = np.dot(embedding_duong, embedding_unknown)
-        
-        if score > 0.45:
-            name = "Duong"
-            now = datetime.now()
+        # Ngưỡng nhận diện (Threshold)
+        if scores[best_idx] > 0.45:
+            user_id = known_ids[best_idx]
+            user_name = known_names[best_idx]
+            user_role = known_roles[best_idx]
             
-            # Kiểm tra xem người này đã điểm danh trước đó chưa
-            if name in last_recorded_times:
-                last_time = last_recorded_times[name]
-                # Tính khoảng cách thời gian (tính bằng giây)
-                diff_seconds = (now - last_time).total_seconds()
-                diff_minutes = diff_seconds / 60
-            else:
-                # Nếu là lần đầu tiên trong phiên chạy này
-                diff_minutes = COOLDOWN_MINUTES + 1 
+            # Nếu là Admin đang đứng trước máy
+            if user_role == "Admin":
+                current_admin_online = user_name
 
-            # CHỈ GHI FILE VÀ HIỆN TÊN NẾU ĐÃ QUA 5 PHÚT
-            if diff_minutes >= COOLDOWN_MINUTES:
-                color = (255, 0, 255) # Màu tím khi ghi nhận thành công
-                
-                # Cập nhật lại thời gian ghi nhận mới nhất
-                last_recorded_times[name] = now
-                
-                # Ghi vào file CSV
-                time_str = now.strftime("%H:%M:%S")
-                date_str = now.strftime("%Y-%m-%d")
-                with open("attendance.csv", "a") as f:
-                    f.write(f"{name},{date_str},{time_str}\n")
-                
-                print(f">>> Đã ghi nhận điểm danh cho {name} lúc {time_str}")
+            # Logic Chấm công: Ghi nhận lần đầu (In) và cập nhật lần cuối (Out)
+            if user_id not in attendance_data:
+                attendance_data[user_id] = {
+                    "name": user_name,
+                    "role": user_role,
+                    "in": now,
+                    "out": now
+                }
+                print(f"[*] {user_name} ({user_role}) vao ca luc: {now.strftime('%H:%M:%S')}")
             else:
-                # Nếu chưa đủ 5 phút, mình đổi màu khung để báo hiệu đang đợi
-                name = f"Waiting ({int(COOLDOWN_MINUTES - diff_minutes)}m left)"
-                color = (0, 255, 255) # Màu vàng báo hiệu đang chờ
+                attendance_data[user_id]["out"] = now
+
+            # Hiển thị UI trên khung hình
+            color = (0, 255, 0) if user_role == "Admin" else (255, 255, 0)
+            bbox = face.bbox.astype(int)
+            cv2.rectangle(frame, (bbox[0], bbox[1]), (bbox[2], bbox[3]), color, 2)
+            cv2.putText(frame, f"[{user_role}] {user_name}", (bbox[0], bbox[1]-10), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
         else:
-            name = "Unknown"
-            color = (0, 0, 255)
+            # Người lạ (Unknown)
+            bbox = face.bbox.astype(int)
+            cv2.rectangle(frame, (bbox[0], bbox[1]), (bbox[2], bbox[3]), (0, 0, 255), 2)
+            cv2.putText(frame, "Unknown", (bbox[0], bbox[1]-10), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
 
-        # Vẽ khung và hiện tên lên màn hình
-        cv2.rectangle(frame, (bbox[0], bbox[1]), (bbox[2], bbox[3]), color, 2)
-        cv2.putText(frame, f"{name} ({score:.2f})", (bbox[0], bbox[1]-10), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+    # ==========================================================
+    # 3. QUẢN LÝ PHÂN QUYỀN VÀ XUẤT BÁO CÁO
+    # ==========================================================
+    key = cv2.waitKey(1) & 0xFF
+    
+    # Chỉ Admin mới thấy dòng hướng dẫn xuất file
+    if current_admin_online:
+        cv2.putText(frame, f"Admin {current_admin_online} - Bam 'S' de xuat bao cao", (10, 30), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        
+        if key == ord('s') or key == ord('S'):
+            filename = f"Bao_cao_{now.strftime('%Y%m%d_%H%M%S')}.csv"
+            with open(filename, "w", encoding="utf-8-sig") as f:
+                f.write("Ma SV,Ho Ten,Chuc Vu,Gio Vao,Gio Ra,Tong Phut\n")
+                for uid, data in attendance_data.items():
+                    duration = (data['out'] - data['in']).total_seconds() / 60
+                    f.write(f"{uid},{data['name']},{data['role']},{data['in'].strftime('%H:%M:%S')},"
+                            f"{data['out'].strftime('%H:%M:%S')},{duration:.1f}\n")
+            print(f"\n[OK] Da xuat bao cao bao mat: {filename}")
+    else:
+        cv2.putText(frame, "Che do Nhan vien: Dang quet...", (10, 30), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        if key == ord('s'):
+            print("\n[!] Canh bao: Ban khong co quyen xuat du lieu!")
 
-    cv2.imshow("He thong Diem danh AI - PTIT", frame)
-    if cv2.waitKey(1) & 0xFF == ord('q'): break
+    cv2.imshow("He thong Diem danh Phan quyen AI - PTIT", frame)
+    if key == ord('q') or key == ord('Q'): break
 
 cap.release()
 cv2.destroyAllWindows()
